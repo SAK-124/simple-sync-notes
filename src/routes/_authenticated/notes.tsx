@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, type CSSProperties } from "react";
 import { supabase } from "@/integrations/supabase/client";
 
 export const Route = createFileRoute("/_authenticated/notes")({
@@ -12,137 +12,227 @@ type Note = { id: string; content: string; updated_at: string };
 function NotesPage() {
   const navigate = useNavigate();
   const { user } = Route.useRouteContext();
-  const [notes, setNotes] = useState<Note[]>([]);
+  const [noteId, setNoteId] = useState<string | null>(null);
+  const [content, setContent] = useState("");
+  const [updatedAt, setUpdatedAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  // Track ids we just wrote locally so realtime echoes don't clobber typing
-  const localWritesRef = useRef<Map<string, number>>(new Map());
-  const saveTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const contentRef = useRef("");
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const localWriteRef = useRef(0);
 
   const load = useCallback(async () => {
-    const { data, error } = await supabase
+    setLoading(true);
+    setError(null);
+
+    const { data, error: loadError } = await supabase
       .from("notes")
       .select("id, content, updated_at")
-      .order("updated_at", { ascending: false });
-    if (!error) setNotes(data ?? []);
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (loadError) {
+      setError(loadError.message);
+      setLoading(false);
+      return;
+    }
+
+    let note = data as Note | null;
+    if (!note) {
+      const { data: created, error: createError } = await supabase
+        .from("notes")
+        .insert({ user_id: user.id, content: "" })
+        .select("id, content, updated_at")
+        .single();
+
+      if (createError) {
+        setError(createError.message);
+        setLoading(false);
+        return;
+      }
+
+      note = created;
+    }
+
+    setNoteId(note.id);
+    setContent(note.content);
+    contentRef.current = note.content;
+    setUpdatedAt(note.updated_at);
     setLoading(false);
-  }, []);
+  }, [user.id]);
 
   useEffect(() => {
     load();
+  }, [load]);
+
+  useEffect(() => {
+    if (!noteId) return;
+
     const channel = supabase
-      .channel("notes-sync")
+      .channel(`notes-sync-${noteId}`)
       .on(
         "postgres_changes",
-        { event: "*", schema: "public", table: "notes", filter: `user_id=eq.${user.id}` },
+        { event: "UPDATE", schema: "public", table: "notes", filter: `id=eq.${noteId}` },
         (payload) => {
-          const row = (payload.new ?? payload.old) as { id?: string } | null;
-          const id = row?.id;
-          // Ignore echoes of our own writes from the last 2s
-          if (id) {
-            const ts = localWritesRef.current.get(id);
-            if (ts && Date.now() - ts < 2000) return;
-          }
-          if (payload.eventType === "DELETE") {
-            setNotes((prev) => prev.filter((n) => n.id !== (payload.old as Note).id));
-          } else if (payload.eventType === "INSERT") {
-            const n = payload.new as Note;
-            setNotes((prev) => (prev.some((x) => x.id === n.id) ? prev : [n, ...prev]));
-          } else if (payload.eventType === "UPDATE") {
-            const n = payload.new as Note;
-            setNotes((prev) => prev.map((x) => (x.id === n.id ? { ...x, content: n.content, updated_at: n.updated_at } : x)));
-          }
+          if (Date.now() - localWriteRef.current < 2000) return;
+          const next = payload.new as Note;
+          setContent(next.content);
+          contentRef.current = next.content;
+          setUpdatedAt(next.updated_at);
         },
       )
       .subscribe();
+
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [load, user.id]);
+  }, [noteId]);
 
-  async function addNote() {
-    const { data, error } = await supabase
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
+  }, []);
+
+  function queueSave(nextContent: string) {
+    if (!noteId) return;
+
+    setContent(nextContent);
+    contentRef.current = nextContent;
+    setSaving(true);
+    setError(null);
+
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(async () => {
+      localWriteRef.current = Date.now();
+      const { data, error: saveError } = await supabase
+        .from("notes")
+        .update({ content: contentRef.current })
+        .eq("id", noteId)
+        .select("updated_at")
+        .single();
+
+      if (saveError) {
+        setError(saveError.message);
+      } else if (data) {
+        setUpdatedAt(data.updated_at);
+      }
+      setSaving(false);
+    }, 500);
+  }
+
+  async function flushSave() {
+    if (!noteId) return;
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    setSaving(true);
+    localWriteRef.current = Date.now();
+    const { data, error: saveError } = await supabase
       .from("notes")
-      .insert({ user_id: user.id, content: "" })
-      .select("id, content, updated_at")
+      .update({ content: contentRef.current })
+      .eq("id", noteId)
+      .select("updated_at")
       .single();
-    if (error) {
-      alert(error.message);
-      return;
-    }
-    if (data) {
-      localWritesRef.current.set(data.id, Date.now());
-      setNotes((prev) => [data, ...prev]);
-    }
-  }
 
-  function onChangeContent(id: string, content: string) {
-    setNotes((prev) => prev.map((n) => (n.id === id ? { ...n, content } : n)));
-    // Debounced auto-save
-    const existing = saveTimersRef.current.get(id);
-    if (existing) clearTimeout(existing);
-    const timer = setTimeout(async () => {
-      localWritesRef.current.set(id, Date.now());
-      await supabase.from("notes").update({ content }).eq("id", id);
-    }, 400);
-    saveTimersRef.current.set(id, timer);
-  }
-
-  async function deleteNote(id: string) {
-    localWritesRef.current.set(id, Date.now());
-    setNotes((prev) => prev.filter((n) => n.id !== id));
-    await supabase.from("notes").delete().eq("id", id);
+    if (saveError) {
+      setError(saveError.message);
+    } else if (data) {
+      setUpdatedAt(data.updated_at);
+    }
+    setSaving(false);
   }
 
   async function signOut() {
+    await flushSave();
     await supabase.auth.signOut();
     navigate({ to: "/auth", replace: true });
   }
 
   return (
-    <div style={{ maxWidth: 640, margin: "40px auto", padding: 16, fontFamily: "system-ui, sans-serif" }}>
-      <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-        <h1 style={{ fontSize: 20, margin: 0 }}>Notes</h1>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <span style={{ fontSize: 12, color: "#666" }}>{user.email}</span>
-          <button onClick={signOut} style={btnSecondary}>Sign out</button>
-        </div>
+    <main style={pageStyle}>
+      <header style={headerStyle}>
+        <h1 style={titleStyle}>Notes</h1>
+        <button onClick={signOut} style={buttonStyle}>Sign out</button>
       </header>
-      <button onClick={addNote} style={btnPrimary}>+ New note</button>
       {loading ? (
-        <p style={{ color: "#666", marginTop: 16 }}>Loading…</p>
-      ) : notes.length === 0 ? (
-        <p style={{ color: "#666", marginTop: 16 }}>No notes yet.</p>
+        <p style={mutedStyle}>Loading…</p>
       ) : (
-        <ul style={{ listStyle: "none", padding: 0, marginTop: 16, display: "flex", flexDirection: "column", gap: 12 }}>
-          {notes.map((n) => (
-            <li key={n.id} style={{ border: "1px solid #ddd", borderRadius: 6, padding: 8 }}>
-              <textarea
-                value={n.content}
-                onChange={(e) => onChangeContent(n.id, e.target.value)}
-                placeholder="Write something…"
-                rows={4}
-                style={{ width: "100%", border: 0, outline: "none", resize: "vertical", fontFamily: "inherit", fontSize: 14, background: "transparent" }}
-              />
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 4 }}>
-                <span style={{ fontSize: 11, color: "#999" }}>
-                  {new Date(n.updated_at).toLocaleString()}
-                </span>
-                <button onClick={() => deleteNote(n.id)} style={btnDanger}>Delete</button>
-              </div>
-            </li>
-          ))}
-        </ul>
+        <>
+          <textarea
+            autoFocus
+            value={content}
+            onChange={(event) => queueSave(event.target.value)}
+            onBlur={flushSave}
+            placeholder="Start typing..."
+            spellCheck={false}
+            style={textareaStyle}
+          />
+          <p style={mutedStyle}>
+            {error ? error : saving ? "Saving…" : updatedAt ? `Saved ${new Date(updatedAt).toLocaleString()}` : "Saved"}
+          </p>
+        </>
       )}
-    </div>
+    </main>
   );
 }
 
-const btnPrimary: React.CSSProperties = {
-  padding: "6px 12px", background: "#111", color: "#fff", border: 0, borderRadius: 4, cursor: "pointer",
-};
-const btnSecondary: React.CSSProperties = {
-  padding: "4px 10px", background: "#eee", color: "#111", border: 0, borderRadius: 4, cursor: "pointer", fontSize: 12,
-};
-const btnDanger: React.CSSProperties = {
-  padding: "4px 10px", background: "transparent", color: "#c00", border: 0, cursor: "pointer", fontSize: 12,
+const pageStyle = {
+  height: "100vh",
+  maxWidth: 900,
+  margin: "0 auto",
+  padding: 16,
+  boxSizing: "border-box",
+  display: "flex",
+  flexDirection: "column",
+  fontFamily: "system-ui, sans-serif",
+} satisfies CSSProperties;
+
+const headerStyle = {
+  display: "flex",
+  justifyContent: "space-between",
+  alignItems: "center",
+  gap: 12,
+  marginBottom: 12,
+} satisfies CSSProperties;
+
+const titleStyle = {
+  fontSize: 18,
+  margin: 0,
+  fontWeight: 600,
+} satisfies CSSProperties;
+
+const buttonStyle = {
+  padding: "6px 10px",
+  background: "#eee",
+  color: "#111",
+  border: "1px solid #ccc",
+  borderRadius: 4,
+  cursor: "pointer",
+} satisfies CSSProperties;
+
+const textareaStyle = {
+  flex: 1,
+  width: "100%",
+  minHeight: 0,
+  boxSizing: "border-box",
+  border: "1px solid #ccc",
+  borderRadius: 4,
+  padding: 12,
+  resize: "none",
+  outline: "none",
+  fontFamily: "system-ui, sans-serif",
+  fontSize: 16,
+  lineHeight: 1.5,
+  background: "#fff",
+  color: "#111",
+} satisfies CSSProperties;
+
+const mutedStyle = {
+  margin: "8px 0 0",
+  color: "#666",
+  fontSize: 12,
 };
