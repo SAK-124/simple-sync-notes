@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, type CSSProperties } from "react";
 import { supabase } from "@/integrations/supabase/client";
 
 export const Route = createFileRoute("/_authenticated/notes")({
@@ -189,7 +189,7 @@ const pageStyle = {
   display: "flex",
   flexDirection: "column",
   fontFamily: "system-ui, sans-serif",
-} satisfies Record<string, string | number>;
+} satisfies CSSProperties;
 
 const headerStyle = {
   display: "flex",
@@ -197,13 +197,13 @@ const headerStyle = {
   alignItems: "center",
   gap: 12,
   marginBottom: 12,
-} satisfies Record<string, string | number>;
+} satisfies CSSProperties;
 
 const titleStyle = {
   fontSize: 18,
   margin: 0,
   fontWeight: 600,
-} satisfies Record<string, string | number>;
+} satisfies CSSProperties;
 
 const buttonStyle = {
   padding: "6px 10px",
@@ -212,7 +212,7 @@ const buttonStyle = {
   border: "1px solid #ccc",
   borderRadius: 4,
   cursor: "pointer",
-} satisfies Record<string, string | number>;
+} satisfies CSSProperties;
 
 const textareaStyle = {
   flex: 1,
@@ -229,7 +229,7 @@ const textareaStyle = {
   lineHeight: 1.5,
   background: "#fff",
   color: "#111",
-} satisfies Record<string, string | number>;
+} satisfies CSSProperties;
 
 const mutedStyle = {
   margin: "8px 0 0",
